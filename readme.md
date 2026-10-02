@@ -1,115 +1,148 @@
-LingoDoc System: AI-Powered English Learning & Parsing
+# LingoDoc System: AI-Powered English Learning & Parsing
 
-🎯 Descripción del Proyecto
+> 📦 **100% local y privado.** Todos los modelos de IA corren en tu máquina con [Ollama](https://ollama.com). Tu información nunca sale de tu equipo.
 
-LingoDoc es una aplicación web y de procesamiento de archivos diseñada para ayudar en el aprendizaje del inglés. Permite a los usuarios subir documentos (texto plano, Word, PDF) e imágenes (fotos, documentos escaneados, texto escrito a mano).
+LingoDoc es una aplicación web para el aprendizaje del inglés. Sube documentos (texto plano, Word, PDF) o imágenes (fotos, documentos escaneados, texto escrito a mano) y el sistema:
 
-El sistema extrae el texto, procesa su contenido mediante Modelos de Lenguaje Grandes (LLMs) locales, y genera una salida estructurada que incluye:
+- Extrae el texto (OCR con visión artificial cuando es necesario).
+- Genera una **aproximación fonética** "leída en español".
+- (Opcional) Añade la **traducción al español**.
+- Guarda el resultado en archivos `.md`, usando **búsqueda semántica (embeddings)** para sugerir si hacer *append* a un archivo existente o crear uno nuevo, todo accesible desde un catálogo web.
 
-El texto original en inglés.
+---
 
-Una aproximación fonética "leída en español".
+## 🛠 Stack Tecnológico
 
-(Opcional) La traducción al español.
+Arquitectura de microservicios, optimizada para despliegues *on-premise* con recursos limitados.
 
-Los resultados se almacenan en archivos .md (Markdown), utilizando un sistema de búsqueda semántica (Embeddings) para sugerir a qué archivo existente se le debe hacer append (agregar el contenido) o si se debe crear uno nuevo. Todo esto disponible a través de un catálogo web.
+| Capa | Tecnología | Rol |
+|---|---|---|
+| Frontend | Vue 3 (Composition API, Vite) | Drag & drop de archivos, toggle de traducción, visor de Markdown del catálogo, selección de coincidencias semánticas |
+| Backend Core | Go | API principal, concurrencia de subidas, orquestación de llamadas a IA, acceso a base de datos, escritura de archivos `.md` |
+| Backend AI | Python + FastAPI | Detección y enrutamiento de tipo de archivo (extracción tradicional vs. visión artificial), comunicación con el motor LLM |
+| Base de Datos Vectorial | PostgreSQL + pgvector | Almacenamiento y búsqueda de embeddings de los archivos `.md` |
+| Motor LLM | Ollama | Ejecución local de modelos de texto, visión y embeddings |
 
-🛠 Stack Tecnológico
+## 🧠 Motor LLM
 
-El proyecto utiliza una arquitectura basada en microservicios, optimizada para despliegues on-premise o locales con recursos limitados.
+**Decisión del stack: Ollama.** Se evaluó `llama.cpp` (el motor base, mínimo consumo pero difícil de orquestar para intercambiar entre modelos de visión y texto) y Ollama, que usa llama.cpp por debajo y añade una API REST nativa y gestión automática de memoria (carga/descarga de modelos según demanda). El análisis completo está en [`docs/adr/001-motor-llm.md`](docs/adr/001-motor-llm.md).
 
-1. Frontend (Interfaz de Usuario)
+### Modelos abiertos y ligeros (cuantizados en GGUF 4-bit)
 
-Framework: Vue 3 (Composition API, Vite).
+| Modelo | Uso | RAM aproximada |
+|---|---|---|
+| `qwen2.5:3b` | Texto y formato | ~3 GB |
+| `qwen2.5-vl:3b` / `llama3.2-vision:11b` | OCR / escritura a mano (ver nota) | ~2–8 GB |
+| `nomic-embed-text` | Embeddings para búsqueda semántica | <1 GB |
 
-Funcionalidades: Drag & Drop de archivos, Toggle para traducción opcional, visualizador de Markdown para el catálogo de archivos, e interfaz de selección de coincidencias semánticas.
+> ⚠️ **Nota sobre RAM:** ejecutar los 3 modelos a la vez (~12 GB con el modelo `:11b` de visión) excede los 16 GB recomendados si el sistema también reserva memoria. Configura `OLLAMA_KEEP_ALIVE` para descargar modelos inactivos, o usa la variante de visión `:3b` en equipos con menos memoria.
 
-2. Backend Core (Orquestador y Gestor de Archivos)
+---
 
-Lenguaje: Go (Golang).
+## ⚙️ Arquitectura: Flujo de Datos (Pipeline)
 
-Rol principal: Servir la API principal, manejar la concurrencia de subidas, orquestar las llamadas al servicio de IA, interactuar con la base de datos y escribir/modificar los archivos .md físicos en el disco.
+```mermaid
+    flowchart TD
+    A[Usuario sube archivo<br/>Vue 3] --> B[Backend Go<br/>guarda archivo temporal]
+    B --> C[Backend AI<br/>Python + FastAPI]
+    C -->|MIME: TXT, DOCX, PDF nativo| D[Ruta rápida<br/>pypdf / python-docx]
+    C -->|MIME: PNG, JPG, PDF escaneado| E[Ruta visual<br/>OCR con llama-vision]
+    E --> O1[Ollama<br/>qwen2.5-vl / llama3.2-vision]
+    D --> F[Texto plano]
+    O1 --> F
+    F --> G[Ollama qwen2.5:3b<br/>fonética + traducción]
+    G --> H[Backend Go recibe texto procesado]
+    H --> I[Ollama nomic-embed-text<br/>embedding del texto]
+    I --> J[(PostgreSQL + pgvector<br/>top-3 archivos .md similares)]
+    J --> K[Vue 3: usuario elige<br/>append a existente o crear nuevo]
+    K --> L[Backend Go<br/>escribe el .md en disco]
+```
 
-3. Backend AI (Procesamiento y Extracción)
+### Fase 1: Recepción y Enrutamiento (Go → Python)
 
-Framework: Python + FastAPI.
+1. El usuario sube el archivo desde Vue 3 al endpoint de Go.
+2. Go lo guarda temporalmente y lo envía al microservicio de Python.
+3. Python evalúa el MIME type:
+   - **Ruta rápida** (TXT, DOCX, PDF con capa de texto): extracción con `pypdf` / `python-docx`.
+   - **Ruta visual** (PNG, JPG, PDF escaneado): si un PDF no devuelve texto con la ruta rápida, se rasteriza y envía a Ollama (`llama3.2-vision`).
 
-Rol principal: Detectar el tipo de archivo y enrutarlo (Extracción de texto tradicional vs. Visión Artificial), y comunicarse con el motor LLM.
+### Fase 2: Procesamiento (Python → Ollama)
 
-Librerías: PyPDF2, python-docx (para ruta rápida de texto).
+Python llama a Ollama (`qwen2.5:3b`) con este System Prompt:
 
-4. Base de Datos Vectorial
+```
+Eres un asistente bilingüe. Tu tarea es extraer o formatear el texto en
+inglés proporcionado, generar su traducción al español (si se requiere) y
+crear una aproximación fonética usando las reglas de lectura del idioma
+español.
 
-Tecnología: PostgreSQL + extensión pgvector.
+Formato requerido:
+([pronunciación leída en español])
+[Texto en inglés] | [Traducción al español]
+```
 
-Rol principal: Almacenar los embeddings (representaciones vectoriales) de los archivos .md existentes para buscar coincidencias semánticas rápidas.
+### Fase 3: Búsqueda Semántica y Guardado (Go → PostgreSQL)
 
-🧠 Motor LLM: Ollama vs. llama.cpp
+1. Go solicita a Ollama (`nomic-embed-text`) el embedding del texto procesado.
+2. Go consulta PostgreSQL (pgvector) buscando los **3 archivos `.md` más similares**.
+3. Vue 3 muestra las coincidencias y el usuario elige: **append** a una coincidencia (ej. `notas_clase.md`) o **crear un archivo nuevo**.
+4. Go escribe el archivo en disco.
 
-Para cumplir con el requerimiento de consumir pocos recursos y ser de fácil implementación, se analizan las dos opciones principales:
+---
 
-llama.cpp: Es el motor base en C/C++. Consume la menor cantidad absoluta de recursos (sin procesos en segundo plano). Sin embargo, es difícil de orquestar si necesitas cambiar rápidamente entre un modelo de Visión y uno de Texto, requiriendo scripts complejos para cargar y descargar modelos de la RAM.
+## 📝 Ejemplo de Salida
 
-Ollama: Utiliza llama.cpp por debajo, por lo que hereda su excelente rendimiento y bajo consumo (soporte para Apple Metal, CUDA, AVX2). Su gran ventaja es que es extremadamente fácil de usar. Ofrece una API REST nativa y gestiona la memoria automáticamente (carga y descarga modelos de la RAM según se necesiten).
+Entrada: imagen con el texto `"I am Carlos and live in Bogota"`, con el flag de traducción activo. El texto inyectado en el Markdown será:
 
-✅ Decisión Oficial del Stack: Ollama. Es el equilibrio perfecto. Ofrece el mismo bajo consumo que llama.cpp, pero automatiza el intercambio entre modelos (Visión, Texto y Embeddings), lo cual es crítico para esta arquitectura.
+```
+(iai am Carlos an. lif bogota)
+I am Carlos and live in Bogota | Yo soy Carlos y vivo en Bogota
+```
 
-Modelos Abiertos y Ligeros (Cuantizados en GGUF 4-bit)
+---
 
-Modelo de Texto y Formato: qwen2.5:3b (Consume ~3GB RAM). Excelente seguimiento de instrucciones y bilingüismo.
+## 🚀 Requisitos de Infraestructura (Local)
 
-Modelo de Visión (OCR/Mano): llama3.2-vision:11b (Consume ~8GB RAM). Excepcional leyendo escritura a mano.
+| Componente | Requisito |
+|---|---|
+| CPU | Soporte AVX2 (Intel Gen 8+ / AMD Ryzen) o ARM (Apple Silicon M1/M2/M3) |
+| RAM | 16 GB recomendados (≈8 GB reservados para Ollama) |
+| Almacenamiento | SSD NVMe altamente recomendado (carga rápida / *hot-swapping* de los pesos de los modelos) |
 
-Modelo de Embeddings: nomic-embed-text (Consume <1GB RAM). Para vectorizar el contenido.
+## 🚦 Quick Start
 
-⚙️ Arquitectura de Flujo de Datos (Pipeline)
+```bash
+# 1. Instalar y descargar los modelos en Ollama
+ollama pull qwen2.5:3b
+ollama pull nomic-embed-text
+ollama pull llama3.2-vision:11b   # opcional: solo si procesarás imágenes/manuscritos
 
-Para los LLMs o desarrolladores leyendo esto, el flujo de ejecución es el siguiente:
+# 2. Levantar PostgreSQL con pgvector
+docker compose up -d postgres
 
-Fase 1: Recepción y Enrutamiento (Go -> Python)
+# 3. Arrancar los servicios
+cd backend-ai && uvicorn main:app --reload
+cd backend-core && go run ./cmd/server
+cd frontend && npm run dev
+```
 
-El usuario sube un archivo vía Vue 3 al endpoint de Go.
+> Los modelos de visión son ~8 GB de descarga. Si solo usarás TXT/DOCX/PDF, omítelo.
 
-Go guarda el archivo temporalmente y lo envía al microservicio de Python.
+---
 
-Python evalúa el MIME type:
+## 📂 Estructura del Proyecto
 
-Ruta Rápida (TXT, DOCX, PDF nativo): Extrae texto con librerías nativas.
+```
+englissh-doc/
+├── frontend/        # Vue 3 + Vite
+├── backend-core/    # Go (API, orquestación, escritura de .md)
+├── backend-ai/      # Python + FastAPI (extracción, llamadas a Ollama)
+├── docs/adr/        # Decisiones arquitectónicas
+└── docker-compose.yml
+```
 
-Ruta Visual (PNG, JPG, PDF escaneado): Envía la imagen a Ollama (llama3.2-vision) para extraer el texto.
+## 📚 Roadmap
 
-Fase 2: Procesamiento Semántico (Python -> Ollama)
-
-Con el texto plano recuperado, Python hace un llamado a Ollama (qwen2.5:3b) con el siguiente System Prompt Estricto:
-
-"Eres un asistente bilingüe. Tu tarea es extraer o formatear el texto en inglés proporcionado, generar su traducción al español (si se requiere) y crear una aproximación fonética usando las reglas de lectura del idioma español. Formato requerido: ([pronunciación leída en español]) \n [Texto en inglés] | [Traducción al español]"
-
-Python devuelve la estructura de texto final a Go.
-
-Fase 3: Búsqueda Semántica y Guardado (Go -> PostgreSQL)
-
-Go recibe el texto procesado.
-
-Go solicita a Ollama (nomic-embed-text) el embedding matemático del nuevo texto.
-
-Go consulta a PostgreSQL (pgvector) buscando los 3 archivos .md más similares semánticamente.
-
-Se devuelve la información a Vue 3. El usuario elige si hacer append a una coincidencia (ej: notas_clase.md) o crear uno nuevo (nuevo_archivo.md).
-
-Go escribe la información en el disco físico.
-
-📝 Ejemplo de Salida (Output Esperado)
-
-Si el usuario procesa una imagen que dice "I am Carlos and live in Bogota" con el flag de traducción activo, el texto a inyectar en el Markdown será:
-
-(__ia am Carlos an. live bogota___)
-I am Carlos and live in bogota | yo soy Carlos y vivo en Bogota
-
-
-🚀 Requisitos de Infraestructura (Local)
-
-CPU: Procesador con soporte AVX2 (Intel Gen 8+ / AMD Ryzen) o ARM (Apple Silicon M1/M2/M3).
-
-RAM: 16 GB recomendados (8GB dedicados exclusivamente al sistema Ollama para modelos).
-
-Almacenamiento: SSD NVMe obligatorio para la carga rápida (hot-swapping) de los pesos de los modelos.
+- [ ] Umbral de similitud configurable para las coincidencias semánticas
+- [ ] Re-vectorización incremental de archivos que crecen por append
+- [ ] Exportación del catálogo
