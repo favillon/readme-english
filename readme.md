@@ -1,148 +1,242 @@
-# LingoDoc System: AI-Powered English Learning & Parsing
+# LingoDoc
 
-> 📦 **100% local y privado.** Todos los modelos de IA corren en tu máquina con [Ollama](https://ollama.com). Tu información nunca sale de tu equipo.
+> 📦 **100% local y privado.** Los modelos corren en tu máquina con [Ollama](https://ollama.com). El texto de tus documentos no sale del equipo.
+>
+> **Estado:** especificación de diseño. En este repositorio todavía no hay código, `docker-compose.yml` ni el ADR enlazado en versiones anteriores. Los comandos de arranque de abajo son el objetivo, no algo que funcione hoy.
 
-LingoDoc es una aplicación web para el aprendizaje del inglés. Sube documentos (texto plano, Word, PDF) o imágenes (fotos, documentos escaneados, texto escrito a mano) y el sistema:
+Aplicación web para aprender inglés a partir de material propio. Subes un documento o una imagen y LingoDoc:
 
-- Extrae el texto (OCR con visión artificial cuando es necesario).
-- Genera una **aproximación fonética** "leída en español".
-- (Opcional) Añade la **traducción al español**.
-- Guarda el resultado en archivos `.md`, usando **búsqueda semántica (embeddings)** para sugerir si hacer *append* a un archivo existente o crear uno nuevo, todo accesible desde un catálogo web.
+1. Extrae el texto (librería nativa, OCR clásico o visión, según el archivo).
+2. Genera una **aproximación fonética** leída con reglas del español.
+3. (Opcional) Añade la **traducción al español**.
+4. Te deja **revisar y corregir** el resultado antes de guardarlo.
+5. Sugiere, por similitud semántica, si añadirlo a un `.md` existente o crear uno nuevo.
+
+El catálogo de notas queda en archivos Markdown legibles en disco. La base vectorial solo indexa; no es la copia de lectura.
 
 ---
 
-## 🛠 Stack Tecnológico
+## Stack
 
-Arquitectura de microservicios, optimizada para despliegues *on-premise* con recursos limitados.
+Microservicios pensados para correr en local, con poca RAM.
 
 | Capa | Tecnología | Rol |
 |---|---|---|
-| Frontend | Vue 3 (Composition API, Vite) | Drag & drop de archivos, toggle de traducción, visor de Markdown del catálogo, selección de coincidencias semánticas |
-| Backend Core | Go | API principal, concurrencia de subidas, orquestación de llamadas a IA, acceso a base de datos, escritura de archivos `.md` |
-| Backend AI | Python + FastAPI | Detección y enrutamiento de tipo de archivo (extracción tradicional vs. visión artificial), comunicación con el motor LLM |
-| Base de Datos Vectorial | PostgreSQL + pgvector | Almacenamiento y búsqueda de embeddings de los archivos `.md` |
-| Motor LLM | Ollama | Ejecución local de modelos de texto, visión y embeddings |
+| Frontend | Vue 3 (Composition API) + Vite | Subida, revisión del resultado, catálogo Markdown, elección de archivo destino |
+| Backend core | Go | API, validación de subidas, orquestación, pgvector, escritura de `.md` |
+| Backend AI | Python + FastAPI | Extracción de texto y llamada al LLM de formato |
+| Índice | PostgreSQL + pgvector | Embeddings de cada fragmento, no del archivo entero |
+| Modelos | Ollama | Texto, visión (solo si hace falta) y embeddings |
 
-## 🧠 Motor LLM
+**Por qué Ollama y no llama.cpp directo.** llama.cpp gasta menos en reposo, pero intercambiar visión, texto y embeddings a mano implica scripts de carga y descarga. Ollama usa llama.cpp por debajo, expone una API REST y libera la RAM cuando el modelo no se usa. Para esta arquitectura eso pesa más que el proceso extra.
 
-**Decisión del stack: Ollama.** Se evaluó `llama.cpp` (el motor base, mínimo consumo pero difícil de orquestar para intercambiar entre modelos de visión y texto) y Ollama, que usa llama.cpp por debajo y añade una API REST nativa y gestión automática de memoria (carga/descarga de modelos según demanda). El análisis completo está en [`docs/adr/001-motor-llm.md`](docs/adr/001-motor-llm.md).
+### Modelos
 
-### Modelos abiertos y ligeros (cuantizados en GGUF 4-bit)
+Cuantización GGUF 4-bit. El modelo de visión grande no es el predeterminado.
 
-| Modelo | Uso | RAM aproximada |
-|---|---|---|
-| `qwen2.5:3b` | Texto y formato | ~3 GB |
-| `qwen2.5-vl:3b` / `llama3.2-vision:11b` | OCR / escritura a mano (ver nota) | ~2–8 GB |
-| `nomic-embed-text` | Embeddings para búsqueda semántica | <1 GB |
+| Modelo | Uso | RAM aprox. | Cuándo |
+|---|---|---|---|
+| `qwen2.5:3b` | Traducción y formato | ~3 GB | Siempre |
+| `nomic-embed-text` | Embeddings | <1 GB | Al confirmar el guardado |
+| `qwen2.5-vl:3b` | OCR de manuscritos o OCR clásico de baja confianza | ~2–3 GB | Solo ruta visual difícil |
+| `llama3.2-vision:11b` | Misma tarea, más calidad | ~8 GB | Opcional, máquina con margen de RAM |
 
-> ⚠️ **Nota sobre RAM:** ejecutar los 3 modelos a la vez (~12 GB con el modelo `:11b` de visión) excede los 16 GB recomendados si el sistema también reserva memoria. Configura `OLLAMA_KEEP_ALIVE` para descargar modelos inactivos, o usa la variante de visión `:3b` en equipos con menos memoria.
+No cargues los tres a la vez. Con 16 GB, `llama3.2-vision:11b` más el modelo de texto deja al sistema sin aire. Usa `OLLAMA_KEEP_ALIVE=0` (o unos segundos) para descargar el modelo al terminar la petición, y deja `:11b` como upgrade, no como default.
+
+| Equipo | Configuración razonable |
+|---|---|
+| 8 GB | Solo TXT/DOCX/PDF con texto. Sin modelo de visión. |
+| 16 GB | Texto + embeddings + visión `:3b`, con descarga automática entre fases. |
+| 24 GB+ | Se puede usar `llama3.2-vision:11b` sin swap constante. |
 
 ---
 
-## ⚙️ Arquitectura: Flujo de Datos (Pipeline)
+## Decisiones de diseño
+
+Estas reglas evitan los fallos típicos de este pipeline. Forman parte del diseño, no del roadmap.
+
+**Extracción en tres escalones, no "visión para todo".**
+
+1. TXT, DOCX y PDF con capa de texto: `pypdf` y `python-docx`. Un PDF se considera escaneado solo si la extracción nativa devuelve vacío (o casi vacío).
+2. Imagen o PDF escaneado con texto impreso: OCR clásico (Tesseract o PaddleOCR). Es más rápido y no ocupa la RAM del modelo de visión.
+3. Manuscrito, o OCR clásico por debajo de un umbral de confianza: recién ahí Ollama visión.
+
+**El LLM no se persiste a ciegas.** La salida de `qwen2.5:3b` se valida con una expresión regular del contrato de abajo. Si no cumple, un reintento. Si vuelve a fallar, se muestra igual en la pantalla de revisión, marcada como no válida. El usuario edita antes de que exista embedding o escritura en disco.
+
+**Se vectoriza el fragmento, no el archivo.** Cada bloque confirmado genera un embedding solo del inglés (sin fonética ni traducción: mezclar idiomas empeora la búsqueda). La similitud de un `.md` es la máxima entre sus fragmentos. Hacer append no deja vectores viejos: el fragmento nuevo se indexa solo. Umbral de similitud configurable; por debajo, no se sugiere append.
+
+**Markdown es la fuente de lectura; Postgres es el índice.** Borrar o editar un `.md` a mano no actualiza pgvector. Un comando `reindex` reconstruye los embeddings desde los archivos. Escrituras concurrentes al mismo `.md` van con lock por archivo.
+
+**La subida no confía en el cliente.** Nombre de archivo saneado (sin `..`, sin ruta absoluta), tamaño máximo, y tipo detectado por contenido, no solo por el header `Content-Type`.
+
+---
+
+## Pipeline
 
 ```mermaid
-    flowchart TD
-    A[Usuario sube archivo<br/>Vue 3] --> B[Backend Go<br/>guarda archivo temporal]
-    B --> C[Backend AI<br/>Python + FastAPI]
-    C -->|MIME: TXT, DOCX, PDF nativo| D[Ruta rápida<br/>pypdf / python-docx]
-    C -->|MIME: PNG, JPG, PDF escaneado| E[Ruta visual<br/>OCR con llama-vision]
-    E --> O1[Ollama<br/>qwen2.5-vl / llama3.2-vision]
-    D --> F[Texto plano]
-    O1 --> F
-    F --> G[Ollama qwen2.5:3b<br/>fonética + traducción]
-    G --> H[Backend Go recibe texto procesado]
-    H --> I[Ollama nomic-embed-text<br/>embedding del texto]
-    I --> J[(PostgreSQL + pgvector<br/>top-3 archivos .md similares)]
-    J --> K[Vue 3: usuario elige<br/>append a existente o crear nuevo]
-    K --> L[Backend Go<br/>escribe el .md en disco]
+flowchart TD
+    A[Vue: sube archivo] --> B[Go: valida, guarda temporal]
+    B --> C[Python: tipo real del archivo]
+    C -->|TXT, DOCX, PDF con texto| D[Extracción nativa]
+    C -->|Imagen o PDF vacío| E[OCR clásico]
+    E -->|Confianza alta| F[Texto plano]
+    E -->|Manuscrito o confianza baja| V[Ollama visión]
+    D --> F
+    V --> F
+    F --> G[Ollama qwen2.5:3b]
+    G --> H{¿Cumple el formato?}
+    H -->|No, primer fallo| G
+    H -->|Sí, o segundo fallo| I[Vue: revisar y editar]
+    I --> J[Go: embedding solo del inglés]
+    J --> K[(pgvector: top 3 fragmentos)]
+    K --> L[Usuario: append o archivo nuevo]
+    L --> M[Go: lock, escribe .md, guarda el vector]
 ```
 
-### Fase 1: Recepción y Enrutamiento (Go → Python)
+Documentos largos no se mandan de una pieza. Python parte por página o párrafo, Go informa progreso, y la revisión es por bloque. OCR más un modelo de 3B pueden tardar minutos en un PDF de muchas páginas; la UI no puede quedar en un spinner mudo.
 
-1. El usuario sube el archivo desde Vue 3 al endpoint de Go.
-2. Go lo guarda temporalmente y lo envía al microservicio de Python.
-3. Python evalúa el MIME type:
-   - **Ruta rápida** (TXT, DOCX, PDF con capa de texto): extracción con `pypdf` / `python-docx`.
-   - **Ruta visual** (PNG, JPG, PDF escaneado): si un PDF no devuelve texto con la ruta rápida, se rasteriza y envía a Ollama (`llama3.2-vision`).
+### Fase 1 — Recepción (Vue → Go → Python)
 
-### Fase 2: Procesamiento (Python → Ollama)
+1. Vue sube el archivo al endpoint de Go.
+2. Go valida tamaño, nombre y tipo real, lo guarda en un temporal y lo reenvía a Python.
+3. Python elige escalón de extracción (nativo, OCR clásico o visión).
 
-Python llama a Ollama (`qwen2.5:3b`) con este System Prompt:
+### Fase 2 — Formato (Python → Ollama)
 
-```
-Eres un asistente bilingüe. Tu tarea es extraer o formatear el texto en
-inglés proporcionado, generar su traducción al español (si se requiere) y
-crear una aproximación fonética usando las reglas de lectura del idioma
-español.
+System prompt:
 
-Formato requerido:
+```text
+Eres un asistente bilingüe. Recibes texto ya extraído. No inventes contenido
+que no esté en el texto. No corrijas el inglés del usuario salvo erratas
+evidentes de OCR, y si lo haces no cambies el sentido.
+
+Para cada oración o párrafo, devuelve exactamente:
+
 ([pronunciación leída en español])
 [Texto en inglés] | [Traducción al español]
+
+Reglas:
+- La fonética usa grafía española para que un hispanohablante la lea en voz alta.
+  No uses IPA. No uses guiones bajos ni markdown.
+- Conserva nombres propios y mayúsculas del inglés.
+- La traducción va solo si el usuario la pidió. Si no la pidió, omite " | " y
+  todo lo que iría después.
+- Una oración por bloque. Separa bloques con una línea en blanco.
+- Si un tramo no es inglés, déjalo como está y no lo traduzcas ni lo fonetices.
 ```
 
-### Fase 3: Búsqueda Semántica y Guardado (Go → PostgreSQL)
+El flag de traducción viaja en la petición, no se infiere del prompt.
 
-1. Go solicita a Ollama (`nomic-embed-text`) el embedding del texto procesado.
-2. Go consulta PostgreSQL (pgvector) buscando los **3 archivos `.md` más similares**.
-3. Vue 3 muestra las coincidencias y el usuario elige: **append** a una coincidencia (ej. `notas_clase.md`) o **crear un archivo nuevo**.
-4. Go escribe el archivo en disco.
+### Fase 3 — Confirmar y guardar (Vue → Go → Postgres)
+
+1. Vue muestra el texto ya validado (o marcado como inválido) para editarlo.
+2. Al confirmar, Go pide a `nomic-embed-text` el embedding **solo de la línea en inglés**.
+3. pgvector devuelve hasta 3 archivos cuya mejor coincidencia supere el umbral.
+4. El usuario elige append (por ejemplo `notas_clase.md`) o un nombre nuevo.
+5. Go toma el lock del archivo, escribe el bloque y guarda el vector del fragmento.
 
 ---
 
-## 📝 Ejemplo de Salida
+## Contrato de salida
 
-Entrada: imagen con el texto `"I am Carlos and live in Bogota"`, con el flag de traducción activo. El texto inyectado en el Markdown será:
+Entrada: `"I am Carlos and live in Bogota"`, con traducción activada.
 
+```text
+(ái am Cárlos and liv in Bogotá)
+I am Carlos and live in Bogota | Yo soy Carlos y vivo en Bogotá
 ```
-(iai am Carlos an. lif bogota)
-I am Carlos and live in Bogota | Yo soy Carlos y vivo en Bogota
+
+Sin traducción:
+
+```text
+(ái am Cárlos and liv in Bogotá)
+I am Carlos and live in Bogota
 ```
+
+Eso es el formato objetivo, no una captura de un modelo de 3B. Un modelo pequeño inventa fonética (`an.`, `lif`, guiones bajos). Por eso el guardado exige el contrato y una revisión humana. La calidad se mide con un set fijo de frases (inglés, fonética esperada, traducción) en el backend de IA, antes de cambiar el prompt o el modelo.
 
 ---
 
-## 🚀 Requisitos de Infraestructura (Local)
+## Requisitos
 
 | Componente | Requisito |
 |---|---|
-| CPU | Soporte AVX2 (Intel Gen 8+ / AMD Ryzen) o ARM (Apple Silicon M1/M2/M3) |
-| RAM | 16 GB recomendados (≈8 GB reservados para Ollama) |
-| Almacenamiento | SSD NVMe altamente recomendado (carga rápida / *hot-swapping* de los pesos de los modelos) |
+| CPU | AVX2 (Intel Gen 8+ / AMD Ryzen) o Apple Silicon |
+| RAM | 16 GB para el flujo con visión ligera. 8 GB si no hay imágenes. 24 GB si se usa el modelo de visión de 11B |
+| Disco | SSD. NVMe recomendado: Ollama carga y descarga pesos entre fases |
+| Software | Ollama, Docker (solo Postgres), Go, Python 3.11+, Node.js |
 
-## 🚦 Quick Start
+GPU no es obligatoria. En Apple Silicon, Ollama usa Metal. En NVIDIA, CUDA. En CPU sola el flujo funciona, más lento.
+
+---
+
+## Arranque previsto
+
+Cuando existan los servicios, el arranque es este. Hoy estos comandos fallan: no hay compose ni código.
 
 ```bash
-# 1. Instalar y descargar los modelos en Ollama
+# Modelos. El de visión 11B es opcional y pesa ~8 GB.
 ollama pull qwen2.5:3b
 ollama pull nomic-embed-text
-ollama pull llama3.2-vision:11b   # opcional: solo si procesarás imágenes/manuscritos
+ollama pull qwen2.5-vl:3b
+# ollama pull llama3.2-vision:11b
 
-# 2. Levantar PostgreSQL con pgvector
+# Índice vectorial
 docker compose up -d postgres
 
-# 3. Arrancar los servicios
+# Tres terminales
 cd backend-ai && uvicorn main:app --reload
 cd backend-core && go run ./cmd/server
 cd frontend && npm run dev
 ```
 
-> Los modelos de visión son ~8 GB de descarga. Si solo usarás TXT/DOCX/PDF, omítelo.
+Variables que el diseño ya da por hechas:
+
+| Variable | Uso |
+|---|---|
+| `OLLAMA_HOST` | URL de Ollama. Default `http://127.0.0.1:11434` |
+| `OLLAMA_KEEP_ALIVE` | `0` en máquinas de 16 GB, para no retener el modelo de visión |
+| `DATABASE_URL` | Postgres con pgvector |
+| `CATALOG_DIR` | Directorio de los `.md`. Go rechaza rutas fuera de aquí |
+| `MAX_UPLOAD_BYTES` | Tope de subida |
+| `SIMILARITY_THRESHOLD` | Mínimo para sugerir append |
 
 ---
 
-## 📂 Estructura del Proyecto
+## Estructura prevista
 
-```
+```text
 englissh-doc/
-├── frontend/        # Vue 3 + Vite
-├── backend-core/    # Go (API, orquestación, escritura de .md)
-├── backend-ai/      # Python + FastAPI (extracción, llamadas a Ollama)
-├── docs/adr/        # Decisiones arquitectónicas
-└── docker-compose.yml
+├── frontend/          # Vue 3 + Vite
+├── backend-core/      # Go: API, lock de archivos, pgvector, reindex
+├── backend-ai/        # FastAPI: extracción, prompt, testdata fonética
+├── docs/adr/          # Decisiones que no caben en este README
+└── docker-compose.yml # Postgres + pgvector
 ```
 
-## 📚 Roadmap
+---
 
-- [ ] Umbral de similitud configurable para las coincidencias semánticas
-- [ ] Re-vectorización incremental de archivos que crecen por append
-- [ ] Exportación del catálogo
+## Roadmap
+
+Fuera del diseño anterior. Orden sugerido:
+
+1. Set de pruebas de fonética y traducción, para no cambiar el prompt a ciegas.
+2. Audio local con [Piper](https://github.com/rhasspy/piper) (CPU, sin GPU) en cada bloque.
+3. Repaso espaciado generado desde los bloques ya guardados (inglés / traducción / fonética).
+4. Exportar el catálogo.
+5. Fonética determinista (`espeak-ng` o equivalente, mapeada a grafía española) si el set de pruebas demuestra que el 3B no es estable. El LLM se quedaría solo con la traducción.
+
+## Decisiones abiertas
+
+No cambian el stack documentado arriba. Conviene cerrarlas antes de escribir código.
+
+| Tema | Opción documentada | Alternativa |
+|---|---|---|
+| Backends | Go orquesta y Python extrae | Un solo backend Python. Menos procesos; Go no es el cuello de botella (lo es el modelo) |
+| Fonética | Prompt sobre `qwen2.5:3b`, con validación y revisión | Librería determinista, y el LLM solo traduce |
+
+## Fuera de alcance (por ahora)
+
+- Cuentas, multiusuario y sync entre máquinas.
+- Corregir gramática inglesa del texto original. Se conserva lo que el usuario subió.
+- Enviar documentos a APIs de pago. Si un modelo no corre en Ollama, no entra.
